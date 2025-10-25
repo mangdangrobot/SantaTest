@@ -98,7 +98,6 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
-    void SetAecMode(int mode);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 

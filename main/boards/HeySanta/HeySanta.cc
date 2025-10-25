@@ -229,8 +229,6 @@ private:
             SetHeadSpeed(100);   // Full speed forward
             vTaskDelay(80 / portTICK_PERIOD_MS);
             
-            SetHeadSpeed(-100);  // Full speed backward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
         }
         SetHeadSpeed(0);
         ESP_LOGI(TAG, "Head shake complete!");

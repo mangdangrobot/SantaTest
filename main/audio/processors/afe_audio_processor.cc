@@ -6,13 +6,11 @@
 #define TAG "AfeAudioProcessor"
 
 AfeAudioProcessor::AfeAudioProcessor()
-    : afe_data_(nullptr), current_aec_mode_(1) { 
+    : afe_data_(nullptr) {
     event_group_ = xEventGroupCreate();
 }
 
 void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
-    ESP_LOGI(TAG, "🔥 AFE Initialize - AEC Mode Testing Enabled!");
-    
     codec_ = codec;
     frame_samples_ = frame_duration_ms * 16000 / 1000;
 
@@ -34,13 +32,11 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
-    
-
-    // ✅ Use dynamic AEC mode instead of a fixed value
-    afe_config->aec_mode = (aec_mode_t)current_aec_mode_;
+  
+  
+    afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_min_noise_ms = 100;
-    
     if (vad_model_name != nullptr) {
         afe_config->vad_model_name = vad_model_name;
     }
@@ -60,25 +56,14 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
 
 #ifdef CONFIG_USE_DEVICE_AEC
     afe_config->aec_init = true;
-    afe_config->vad_init = false; 
-    ESP_LOGI(TAG, "AEC-ONLY MODE: AEC=true, VAD=false");
+    afe_config->vad_init = false;
 #else
     afe_config->aec_init = false;
     afe_config->vad_init = true;
-    ESP_LOGI(TAG, "VAD-ONLY MODE: AEC=false, VAD=true");
 #endif
-
-    ESP_LOGI(TAG, "=== AFE Configuration ===");
-    ESP_LOGI(TAG, "AEC Init: %s", afe_config->aec_init ? "true" : "false");
-    ESP_LOGI(TAG, "VAD Init: %s", afe_config->vad_init ? "true" : "false");
-    ESP_LOGI(TAG, "AEC Mode: %d", current_aec_mode_);
-    ESP_LOGI(TAG, "Input Format: %s", input_format.c_str());
-    ESP_LOGI(TAG, "========================");
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-    
-    ESP_LOGI(TAG, "AFE initialized successfully with AEC mode: %d", current_aec_mode_);
     
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
@@ -109,12 +94,10 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
 }
 
 void AfeAudioProcessor::Start() {
-    ESP_LOGI(TAG, "Starting AFE processor with AEC mode: %d", current_aec_mode_);
     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
 }
 
 void AfeAudioProcessor::Stop() {
-    ESP_LOGI(TAG, "Stopping AFE processor");
     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
     if (afe_data_ != nullptr) {
         afe_iface_->reset_buffer(afe_data_);
@@ -136,10 +119,8 @@ void AfeAudioProcessor::OnVadStateChange(std::function<void(bool speaking)> call
 void AfeAudioProcessor::AudioProcessorTask() {
     auto fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
     auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
-    ESP_LOGI(TAG, "Audio communication task started (AEC Mode %d), feed size: %d fetch size: %d",
-        current_aec_mode_, feed_size, fetch_size);
-
-    int clock_ticks = 0;
+    ESP_LOGI(TAG, "Audio communication task started, feed size: %d fetch size: %d",
+        feed_size, fetch_size);
 
     while (true) {
         xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
@@ -156,12 +137,7 @@ void AfeAudioProcessor::AudioProcessorTask() {
         }
 
 
-        // ✅ Print AEC status every 100 cycles
-        if (clock_ticks % 100 == 0) {
-            ESP_LOGI(TAG, "AEC Mode %d running, VAD State: %d", 
-                     current_aec_mode_, res->vad_state);
-        }
-        clock_ticks++;
+        // VAD state change
 
         if (vad_state_change_callback_) {
             if (res->vad_state == VAD_SPEECH && !is_speaking_) {
@@ -197,60 +173,15 @@ void AfeAudioProcessor::AudioProcessorTask() {
 }
 
 void AfeAudioProcessor::EnableDeviceAec(bool enable) {
-    ESP_LOGI(TAG, "=== EnableDeviceAec called: %s (Current AEC Mode: %d) ===", 
-             enable ? "true" : "false", current_aec_mode_);
-    
     if (enable) {
 #if CONFIG_USE_DEVICE_AEC
+        afe_iface_->disable_vad(afe_data_);
         afe_iface_->enable_aec(afe_data_);
-        ESP_LOGI(TAG, "AEC enabled with mode: %d", current_aec_mode_);
 #else
         ESP_LOGE(TAG, "Device AEC is not supported");
 #endif
     } else {
         afe_iface_->disable_aec(afe_data_);
         afe_iface_->enable_vad(afe_data_);
-        ESP_LOGI(TAG, "AEC disabled, VAD enabled");
     }
-}
-
-// Additional AEC configuration methods
-void AfeAudioProcessor::SetAecMode(int aec_mode) {
-    ESP_LOGI(TAG, "=== SetAecMode called: %d -> %d ===", current_aec_mode_, aec_mode);
-    
-    if (aec_mode < 0 || aec_mode > 2) {
-        ESP_LOGE(TAG, "Invalid AEC mode: %d (valid range: 0-2)", aec_mode);
-        return;
-    }
-    
-    current_aec_mode_ = aec_mode;
-    ESP_LOGW(TAG, "AEC mode changed to %d. Note: Requires AFE restart to take effect!", aec_mode);
-    ESP_LOGI(TAG, "You may need to restart voice processing for the new AEC mode to be applied.");
-}
-
-int AfeAudioProcessor::GetCurrentAecMode() {
-    return current_aec_mode_;
-}
-
-void AfeAudioProcessor::PrintAfeStatus() {
-    ESP_LOGI(TAG, "=== AFE Status ===");
-    ESP_LOGI(TAG, "Current AEC Mode: %d", current_aec_mode_);
-    ESP_LOGI(TAG, "AFE Running: %s", IsRunning() ? "Yes" : "No");
-    ESP_LOGI(TAG, "Frame Samples: %d", frame_samples_);
-    ESP_LOGI(TAG, "AFE Interface: %s", afe_iface_ ? "Valid" : "NULL");
-    ESP_LOGI(TAG, "AFE Data: %s", afe_data_ ? "Valid" : "NULL");
-    if (afe_data_) {
-        ESP_LOGI(TAG, "Feed Size: %zu", afe_iface_->get_feed_chunksize(afe_data_));
-        ESP_LOGI(TAG, "Fetch Size: %zu", afe_iface_->get_fetch_chunksize(afe_data_));
-    }
-    ESP_LOGI(TAG, "==================");
-}
-
-void AfeAudioProcessor::PrintAvailableAecModes() {
-    ESP_LOGI(TAG, "=== Available AEC Modes ===");
-    ESP_LOGI(TAG, "Mode 0: Usually softest AEC");
-    ESP_LOGI(TAG, "Mode 1: Medium AEC");  
-    ESP_LOGI(TAG, "Mode 2: Strongest AEC");
-    ESP_LOGI(TAG, "Current mode: %d", current_aec_mode_);
-    ESP_LOGI(TAG, "===========================");
 }

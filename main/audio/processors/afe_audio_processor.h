@@ -28,19 +28,6 @@ public:
     size_t GetFeedSize() override;
     void EnableDeviceAec(bool enable) override;
 
-    // AEC Configuration methods
-    void PrintAfeStatus();
-    void SetAecMode(int aec_mode);
-    void SetAecSuppressionLevel(int level);
-    int GetCurrentAecMode();
-    void SetVadSensitivity(int sensitivity);
-    void PrintAvailableAecModes();
-    
-    // Configuration query methods
-    bool IsAecEnabled();
-    bool IsVadEnabled();
-    void GetAfeStatus();
-
 private:
     EventGroupHandle_t event_group_ = nullptr;
     esp_afe_sr_iface_t* afe_iface_ = nullptr;
@@ -52,16 +39,7 @@ private:
     bool is_speaking_ = false;
     std::vector<int16_t> output_buffer_;
 
-
-    int current_aec_mode_ = 1;  
-    int current_suppression_level_ = 2;  
-    int current_vad_sensitivity_ = 0;  
-    bool aec_enabled_ = false;
-    bool vad_enabled_ = false;
-
     void AudioProcessorTask();
-    void UpdateAfeConfiguration();
-    bool ReinitializeAfe();
 };
 
-#endif
+#endif 

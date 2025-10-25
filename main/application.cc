@@ -1,5 +1,4 @@
 #include "application.h"
-#include <esp_afe_sr_models.h> 
 #include "board.h"
 #include "display.h"
 #include "system_info.h"
@@ -357,18 +356,7 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
-        if (speaking) {
-        ESP_LOGI(TAG, "User speech detected via VAD!");
-        
 
-        // Check if TTS needs to be interrupted
-            if (device_state_ == kDeviceStateSpeaking) {
-                ESP_LOGW(TAG, "User interruption detected - stopping current TTS");
-                Schedule([this]() {
-                    AbortSpeaking(kAbortReasonNone);
-                });
-            }
-        }
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);
@@ -743,11 +731,6 @@ void Application::Start() {
 
     // Print heap stats
     SystemInfo::PrintHeapStats();
-    
-    // Set the AEC mode
-    ESP_LOGI(TAG, "Setting custom AEC mode");
-    audio_service_.SetAecMode(1);
-
 }
 
 void Application::OnClockTimer() {
@@ -794,7 +777,7 @@ void Application::OnClockTimer() {
             } else {
                 ESP_LOGW(TAG, "Skipping deactivate sound - low memory");
             }
-    
+            
             Schedule([this]() {
                 if (protocol_ && protocol_->IsAudioChannelOpened()) {
                     ESP_LOGI(TAG, "STT timeout: Force closing audio channel");
