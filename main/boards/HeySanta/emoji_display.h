@@ -6,7 +6,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include "anim_player.h"
-#include "mmap_generate_assets_A.h"
+#include "mmap_generate_emoji.h"
 
 namespace anim {
 

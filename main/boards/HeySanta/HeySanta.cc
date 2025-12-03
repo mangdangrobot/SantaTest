@@ -225,12 +225,24 @@ private:
     void HeadShakeOnly() {
         ESP_LOGI(TAG, "Head shake (on/off mode)!");
         
+        // Soft start for head motor to reduce current surge
+        const int target_speed = 100;
+        const int ramp_steps = 5;
+        
         for (int i = 0; i < 50; i++) {
-            SetHeadSpeed(100);   // Full speed forward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
+            // Ramp up forward
+            for (int step = 1; step <= ramp_steps; step++) {
+                SetHeadSpeed((target_speed * step) / ramp_steps);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total forward
             
-            SetHeadSpeed(-100);  // Full speed backward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
+            // Ramp up backward
+            for (int step = 1; step <= ramp_steps; step++) {
+                SetHeadSpeed(-(target_speed * step) / ramp_steps);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total backward
         }
         SetHeadSpeed(0);
         ESP_LOGI(TAG, "Head shake complete!");
@@ -291,14 +303,35 @@ private:
         head_shake_active = false;
         ESP_LOGI(TAG, "Hip shake (on/off mode)!");
         SetHeadSpeed(0);
+        
+        // Soft start: gradually ramp up motor speed to avoid current surge
+        const int target_speed = 72;
+        const int ramp_steps = 8;
+        int step_delay_ms = 30;
+        
         for (int i = 0; i < 12; i++) {
-            SetHipSpeed(72);    // Forward
-            vTaskDelay(150 / portTICK_PERIOD_MS);
-            SetHipSpeed(0);      // Stop - adds gentleness
+            // Gradual acceleration forward
+            for (int step = 1; step <= ramp_steps; step++) {
+                int speed = (target_speed * step) / ramp_steps;
+                SetHipSpeed(speed);
+                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
+            
+            // Stop
+            SetHipSpeed(0);
             vTaskDelay(50 / portTICK_PERIOD_MS);
-            SetHipSpeed(-72);   // Backward
-            vTaskDelay(150 / portTICK_PERIOD_MS);
-            SetHipSpeed(0);      // Stop - adds gentleness
+            
+            // Gradual acceleration backward
+            for (int step = 1; step <= ramp_steps; step++) {
+                int speed = -(target_speed * step) / ramp_steps;
+                SetHipSpeed(speed);
+                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
+            
+            // Stop
+            SetHipSpeed(0);
             vTaskDelay(50 / portTICK_PERIOD_MS);
         }
         SetHipSpeed(0);
