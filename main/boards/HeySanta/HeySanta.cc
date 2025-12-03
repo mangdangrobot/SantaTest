@@ -225,12 +225,24 @@ private:
     void HeadShakeOnly() {
         ESP_LOGI(TAG, "Head shake (on/off mode)!");
         
+        // Soft start for head motor to reduce current surge
+        const int target_speed = 100;
+        const int ramp_steps = 5;
+        
         for (int i = 0; i < 50; i++) {
-            SetHeadSpeed(100);   // Full speed forward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
+            // Ramp up forward
+            for (int step = 1; step <= ramp_steps; step++) {
+                SetHeadSpeed((target_speed * step) / ramp_steps);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total forward
             
-            SetHeadSpeed(-100);  // Full speed backward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
+            // Ramp up backward
+            for (int step = 1; step <= ramp_steps; step++) {
+                SetHeadSpeed(-(target_speed * step) / ramp_steps);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total backward
         }
         SetHeadSpeed(0);
         ESP_LOGI(TAG, "Head shake complete!");
@@ -255,8 +267,8 @@ private:
             }
             
             // ON phase - 1 second
-            SetHeadSpeed(90);
-            for (int j = 0; j < 6 && head_shake_active; j++) {
+            SetHeadSpeed(100);
+            for (int j = 0; j < 10 && head_shake_active; j++) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
             
@@ -264,7 +276,7 @@ private:
             
             // OFF phase - 1 second  
             SetHeadSpeed(0);
-            for (int j = 0; j < 11 && head_shake_active; j++) {
+            for (int j = 0; j < 10 && head_shake_active; j++) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
         }
@@ -291,14 +303,35 @@ private:
         head_shake_active = false;
         ESP_LOGI(TAG, "Hip shake (on/off mode)!");
         SetHeadSpeed(0);
+        
+        // Soft start: gradually ramp up motor speed to avoid current surge
+        const int target_speed = 72;
+        const int ramp_steps = 8;
+        int step_delay_ms = 30;
+        
         for (int i = 0; i < 12; i++) {
-            SetHipSpeed(72);    // Forward
-            vTaskDelay(150 / portTICK_PERIOD_MS);
-            SetHipSpeed(0);      // Stop - adds gentleness
+            // Gradual acceleration forward
+            for (int step = 1; step <= ramp_steps; step++) {
+                int speed = (target_speed * step) / ramp_steps;
+                SetHipSpeed(speed);
+                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
+            
+            // Stop
+            SetHipSpeed(0);
             vTaskDelay(50 / portTICK_PERIOD_MS);
-            SetHipSpeed(-72);   // Backward
-            vTaskDelay(150 / portTICK_PERIOD_MS);
-            SetHipSpeed(0);      // Stop - adds gentleness
+            
+            // Gradual acceleration backward
+            for (int step = 1; step <= ramp_steps; step++) {
+                int speed = -(target_speed * step) / ramp_steps;
+                SetHipSpeed(speed);
+                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
+            }
+            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
+            
+            // Stop
+            SetHipSpeed(0);
             vTaskDelay(50 / portTICK_PERIOD_MS);
         }
         SetHipSpeed(0);
@@ -358,6 +391,15 @@ private:
             
             // Send a system command to the server to exit/quit
             app.SendSystemCommand("exit");
+
+             // Also trigger local disconnect after a short delay to ensure message is sent
+            auto disconnect_task = [](void* param) {
+                vTaskDelay(500 / portTICK_PERIOD_MS); // Wait 500ms for message to be sent
+                auto& app = Application::GetInstance();
+                app.AbortSpeaking(kAbortReasonNone); // Stop any ongoing speech
+                vTaskDelete(NULL);
+            };
+            xTaskCreate(disconnect_task, "disconnect_task", 2048, NULL, 5, NULL);
             
             return " Ho ho ho! Santa is telling the server to end this session. See you soon! 🎄";
         });
