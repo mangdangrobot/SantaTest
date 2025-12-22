@@ -53,7 +53,7 @@ EmojiPlayer::EmojiPlayer(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t
         .on_color_trans_done = OnFlushIoReady,
     };
     esp_lcd_panel_io_register_event_callbacks(panel_io, &cbs, player_handle_);
-    StartPlayer(MMAP_EMOJI_STAR_AAF, true, 15);
+    StartPlayer(MMAP_EMOJI_HAPPY_AAF, true, 15);
 }
 
 EmojiPlayer::~EmojiPlayer()
@@ -82,7 +82,7 @@ void EmojiPlayer::StartPlayer(int aaf, bool repeat, int fps)
 
         anim_player_set_src_data(player_handle_, src_data, src_len);
         anim_player_get_segment(player_handle_, &start, &end);
-        if(MMAP_EMOJI_STAR_AAF == aaf){
+        if(MMAP_EMOJI_HAPPY_AAF == aaf){
             start = 7;
         }
         anim_player_set_segment(player_handle_, start, end, fps, true);
@@ -115,18 +115,19 @@ void EmojiWidget::SetEmotion(const char* emotion)
 
     using Param = std::tuple<int, bool, int>;
     static const std::unordered_map<std::string, Param> emotion_map = {
-         {"bell",       {MMAP_EMOJI_BELL_AAF,      true, 25}},
-         {"blinking",   {MMAP_EMOJI_BLINKING_AAF,  true, 10}},
-         {"cookie",     {MMAP_EMOJI_COOKIE_AAF,    true, 24}},
-         {"heart",      {MMAP_EMOJI_HEART_AAF,     true, 25}},
-         {"sleep",      {MMAP_EMOJI_SLEEP_AAF,     true, 24}},
-         {"snowman",    {MMAP_EMOJI_SNOWMAN_AAF,   true, 25}},
-         {"star",       {MMAP_EMOJI_STAR_AAF,      true, 25}},
-         {"elf",        {MMAP_EMOJI_WHOLE_ELF_AAF, true, 21}},
-         {"wrong",      {MMAP_EMOJI_CROSS_AAF,     true, 24}},
-         {"wrong2",      {MMAP_EMOJI_CROSS2_AAF,     true, 24}},
+         {"bell",       {MMAP_EMOJI_HAPPY_AAF,      true, 25}},
+         {"blinking",   {MMAP_EMOJI_HAPPY_AAF,  true, 10}},
+         {"blink_once", {MMAP_EMOJI_HAPPY_AAF, true, 24}},
+         {"cookie",     {MMAP_EMOJI_HAPPY_AAF,    true, 24}},
+         {"heart",      {MMAP_EMOJI_HAPPY_AAF,     true, 25}},
+         {"sleep",      {MMAP_EMOJI_HAPPY_AAF,     true, 24}},
+         {"snowman",    {MMAP_EMOJI_HAPPY_AAF,   true, 25}},
+         {"star",       {MMAP_EMOJI_HAPPY_AAF,      true, 25}},
+         {"elf",        {MMAP_EMOJI_HAPPY_AAF, true, 21}},
+         {"wrong",      {MMAP_EMOJI_HAPPY_AAF,     true, 24}},
+         {"wrong2",      {MMAP_EMOJI_HAPPY_AAF,     true, 24}},
          {"happy",      {MMAP_EMOJI_HAPPY_AAF,     true, 24}},
-         {"happy2",      {MMAP_EMOJI_HAPPY2_AAF,     true, 24}}
+         {"happy2",      {MMAP_EMOJI_HAPPY_AAF,     true, 24}}
     };
 
     auto it = emotion_map.find(emotion);
@@ -134,10 +135,10 @@ void EmojiWidget::SetEmotion(const char* emotion)
         const auto& [aaf, repeat, fps] = it->second;
         player_->StartPlayer(aaf, repeat, fps);
     } else if (strcmp(emotion, "neutral") == 0) {
-        player_->StartPlayer(MMAP_EMOJI_BLINKING_AAF, true, 20);
+        player_->StartPlayer(MMAP_EMOJI_HAPPY_AAF, true, 20);
     } else {
         ESP_LOGW(TAG, "Unknown emotion: %s", emotion);
-        player_->StartPlayer(MMAP_EMOJI_CROSS_AAF, true, 20); // Default to blinking if unknown
+        player_->StartPlayer(MMAP_EMOJI_HAPPY_AAF, true, 20); // Default to blinking if unknown
     }
 }
 
@@ -145,7 +146,7 @@ void EmojiWidget::SetStatus(const char* status)
 {
     if (player_) {
         if (strcmp(status, "聆听中...") == 0) {
-            player_->StartPlayer(MMAP_EMOJI_CROSS_AAF, true, 15);
+            player_->StartPlayer(MMAP_EMOJI_HAPPY_AAF, true, 15);
         } else if (strcmp(status, "待命") == 0) {
             player_->StartPlayer(MMAP_EMOJI_HAPPY_AAF, true, 15);
         }
