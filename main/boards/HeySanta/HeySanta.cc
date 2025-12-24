@@ -1,15 +1,12 @@
 #include "wifi_board.h"
-// #include "audio_codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
 #include "i2c_device.h"
-// #include "iot/thing_manager.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
 #include "audio/codecs/santa_audio_codec.h"
-// #include "audio_codecs/no_audio_codec.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
@@ -18,29 +15,372 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
-#include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_system.h"
-#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "emoji_display.h"
 #include <string.h>
 #include <cstdlib>
+#include <cmath>
 
 #define TAG "HeySanta"
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_awesome_20_4);
 
-float m1_coefficient = 1.0;
-float m2_coefficient = 1.0;
+// ─────────────────────────────────────────────────────────────
+// STS3032 Servo Protocol Definitions
+// ─────────────────────────────────────────────────────────────
+#define SERVO_UART_NUM UART_NUM_1
+#define SERVO_TX_PIN GPIO_NUM_10
+#define SERVO_RX_PIN GPIO_NUM_11
+#define SERVO_TXEN_PIN GPIO_NUM_3
+#define SERVO_BAUD_RATE 1000000
 
+#define STS_FRAME_HEADER 0xFF
+#define STS_BROADCAST_ID 0xFE
+#define STS_PING 0x01
+#define STS_WRITE 0x03
+#define STS_SYNC_WRITE 0x83
+#define STS_TORQUE_ENABLE 0x28
+#define STS_GOAL_POSITION_L 0x2A
+
+// Servo IDs
+#define SERVO_FL 2
+#define SERVO_FR 1
+#define SERVO_BL 4
+#define SERVO_BR 3
+
+// Neutral positions
+#define NEUTRAL_FL 80
+#define NEUTRAL_FR 80
+#define NEUTRAL_BL 260
+#define NEUTRAL_BR 260
+
+// ─────────────────────────────────────────────────────────────
+// Servo Control Class
+// ─────────────────────────────────────────────────────────────
+class ServoController {
+private:
+    int global_servo_speed = 4095;
+    bool is_flipped = false;
+    
+    struct ServoState {
+        float last_unwrapped_hw;
+    };
+    
+    ServoState servo_states[4] = {
+        {NEUTRAL_FL},
+        {360.0f - NEUTRAL_FR},
+        {NEUTRAL_BL},
+        {360.0f - NEUTRAL_BR}
+    };
+    
+    struct {
+        float fl, fr, bl, br;
+    } continuous_pos = {NEUTRAL_FL, NEUTRAL_FR, NEUTRAL_BL, NEUTRAL_BR};
+
+    static inline float wrap_0_360(float a) {
+        float r = fmodf(a, 360.0f);
+        if (r < 0) r += 360.0f;
+        return r;
+    }
+
+    static inline uint16_t angle_to_position(float angle_0_360) {
+        if (angle_0_360 < 0) angle_0_360 = wrap_0_360(angle_0_360);
+        if (angle_0_360 >= 360.0f) angle_0_360 = wrap_0_360(angle_0_360);
+        return (uint16_t)lroundf(angle_0_360 * 4095.0f / 360.0f);
+    }
+
+    static inline float unwrap_to_nearest(float current, float target) {
+        float k = roundf((current - target) / 360.0f);
+        return target + 360.0f * k;
+    }
+
+    float map_target_to_hw_unwrapped(float target_continuous, bool reverse, float last_unwrapped_hw) {
+        float t = target_continuous;
+        if (reverse) t = 360.0f - t;
+        return unwrap_to_nearest(last_unwrapped_hw, t);
+    }
+
+    static uint8_t sts_checksum(uint8_t *buf, int len) {
+        uint8_t sum = 0;
+        for (int i = 2; i < len - 1; i++) sum += buf[i];
+        return (uint8_t)(~sum);
+    }
+
+    void sts_send_packet(uint8_t id, uint8_t cmd, uint8_t *params, int param_len) {
+        uint8_t packet[128];
+        packet[0] = STS_FRAME_HEADER;
+        packet[1] = STS_FRAME_HEADER;
+        packet[2] = id;
+        packet[3] = param_len + 2;
+        packet[4] = cmd;
+        if (params && param_len > 0) memcpy(&packet[5], params, param_len);
+        
+        int total_len = 5 + param_len + 1;
+        packet[total_len - 1] = sts_checksum(packet, total_len);
+
+        gpio_set_level(SERVO_TXEN_PIN, 1);
+        uart_flush(SERVO_UART_NUM);
+        uart_write_bytes(SERVO_UART_NUM, packet, total_len);
+        uart_wait_tx_done(SERVO_UART_NUM, pdMS_TO_TICKS(50));
+        gpio_set_level(SERVO_TXEN_PIN, 0);
+    }
+
+    void sts_enable_torque(uint8_t id, bool enable) {
+        uint8_t params[2];
+        params[0] = STS_TORQUE_ENABLE;
+        params[1] = enable ? 1 : 0;
+        sts_send_packet(id, STS_WRITE, params, 2);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    void sts_sync_write_positions(uint8_t *ids, float *angles_0_360, uint8_t num_servos, uint16_t speed) {
+        uint8_t params[128];
+        params[0] = STS_GOAL_POSITION_L;
+        params[1] = 6;
+
+        int idx = 2;
+        for (int i = 0; i < num_servos; i++) {
+            float a = wrap_0_360(angles_0_360[i]);
+            uint16_t position = angle_to_position(a);
+
+            params[idx++] = ids[i];
+            params[idx++] = position & 0xFF;
+            params[idx++] = (position >> 8) & 0xFF;
+            params[idx++] = 0x00;
+            params[idx++] = 0x00;
+            params[idx++] = speed & 0xFF;
+            params[idx++] = (speed >> 8) & 0xFF;
+        }
+
+        sts_send_packet(STS_BROADCAST_ID, STS_SYNC_WRITE, params, idx);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    void servo_write_all(float fl, float fr, float bl, float br, uint16_t speed) {
+        uint8_t ids[] = {SERVO_FL, SERVO_FR, SERVO_BL, SERVO_BR};
+
+        continuous_pos.fl = fl;
+        continuous_pos.fr = fr;
+        continuous_pos.bl = bl;
+        continuous_pos.br = br;
+
+        float unwrapped_hw[4];
+        unwrapped_hw[0] = map_target_to_hw_unwrapped(fl, false, servo_states[0].last_unwrapped_hw);
+        unwrapped_hw[1] = map_target_to_hw_unwrapped(fr, true,  servo_states[1].last_unwrapped_hw);
+        unwrapped_hw[2] = map_target_to_hw_unwrapped(bl, false, servo_states[2].last_unwrapped_hw);
+        unwrapped_hw[3] = map_target_to_hw_unwrapped(br, true,  servo_states[3].last_unwrapped_hw);
+
+        for (int i = 0; i < 4; i++) servo_states[i].last_unwrapped_hw = unwrapped_hw[i];
+
+        float hw_wrapped[4] = {
+            wrap_0_360(unwrapped_hw[0]),
+            wrap_0_360(unwrapped_hw[1]),
+            wrap_0_360(unwrapped_hw[2]),
+            wrap_0_360(unwrapped_hw[3]),
+        };
+
+        sts_sync_write_positions(ids, hw_wrapped, 4, speed);
+    }
+
+public:
+    void Initialize() {
+        ESP_LOGI(TAG, "Initializing servo controller (robot dog inside HeySanta)...");
+        
+        // Configure TX enable pin
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << SERVO_TXEN_PIN),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(SERVO_TXEN_PIN, 0);
+
+        // Configure UART
+        uart_config_t uart_config = {
+            .baud_rate = SERVO_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_DEFAULT,
+        };
+
+        ESP_ERROR_CHECK(uart_driver_install(SERVO_UART_NUM, 2048, 2048, 0, NULL, 0));
+        ESP_ERROR_CHECK(uart_param_config(SERVO_UART_NUM, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(SERVO_UART_NUM, SERVO_TX_PIN, SERVO_RX_PIN,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Enable torque on all servos
+        ESP_LOGI(TAG, "Enabling servo torque...");
+        for (uint8_t id = 1; id <= 4; id++) {
+            sts_enable_torque(id, true);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        MoveInit();
+    }
+
+    void MoveInit() {
+        ESP_LOGI(TAG, "Dog: Moving to neutral position");
+        continuous_pos.fl = NEUTRAL_FL;
+        continuous_pos.fr = NEUTRAL_FR;
+        continuous_pos.bl = NEUTRAL_BL;
+        continuous_pos.br = NEUTRAL_BR;
+
+        servo_states[0].last_unwrapped_hw = NEUTRAL_FL;
+        servo_states[1].last_unwrapped_hw = 360.0f - NEUTRAL_FR;
+        servo_states[2].last_unwrapped_hw = NEUTRAL_BL;
+        servo_states[3].last_unwrapped_hw = 360.0f - NEUTRAL_BR;
+        
+        servo_write_all(NEUTRAL_FL, NEUTRAL_FR, NEUTRAL_BL, NEUTRAL_BR, (uint16_t)global_servo_speed);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    void MoveReset() {
+        ESP_LOGI(TAG, "Dog: Resetting to neutral");
+        servo_write_all(NEUTRAL_FL, NEUTRAL_FR, NEUTRAL_BL, NEUTRAL_BR, (uint16_t)global_servo_speed);
+        is_flipped = false;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    void WalkForward(int loops = 6) {
+        ESP_LOGI(TAG, "Dog: >>> WALKING FORWARD <<<");
+        int FL_angles[] = {65, 35, 100, 65};
+        int FR_angles[] = {65, 95, 65, 40};
+        int BL_angles[] = {210, 245, 210, 175};
+        int BR_angles[] = {210, 180, 240, 210};
+        uint16_t delays_ms[] = {175, 135, 135, 135};
+
+        for (int loop = 0; loop < loops; loop++) {
+            for (int i = 0; i < 4; i++) {
+                servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+                vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+            }
+        }
+        MoveReset();
+    }
+
+    void Dance() {
+        ESP_LOGI(TAG, "Dog: >>> DANCING <<<");
+        int FL_dance[] = {65,50,35,20,35,50,65,45,25,5,25,45,65,40,65,30,65,40,65,30,15,30,65};
+        int FR_dance[] = {65,80,95,110,95,80,65,85,105,125,105,85,65,90,65,100,65,90,65,100,115,100,65};
+        int BL_dance[] = {210,225,240,255,240,225,210,230,250,265,250,230,210,235,210,245,210,235,210,245,260,245,210};
+        int BR_dance[] = {210,195,180,165,180,195,210,190,170,155,170,190,210,185,210,175,210,185,210,175,160,175,210};
+        int num_steps = 23;
+
+        for (int loop = 0; loop < 4; loop++) {
+            for (int i = 0; i < num_steps; i++) {
+                servo_write_all(FL_dance[i], FR_dance[i], BL_dance[i], BR_dance[i], (uint16_t)global_servo_speed);
+                vTaskDelay(40 / portTICK_PERIOD_MS);
+            }
+        }
+        MoveReset();
+    }
+
+    void Flip() {
+        ESP_LOGI(TAG, "Dog: >>> FLIP <<<");
+        if (!is_flipped) {
+            int FL_angles[] = {210, 185, 210, 355};
+            int FR_angles[] = {210, 185, 210, 355};
+            int BL_angles[] = {165, 185, 205, 20};
+            int BR_angles[] = {165, 185, 205, 20};
+            uint16_t delays_ms[] = {50, 200, 150, 200};
+
+            for (int i = 0; i < 4; i++) {
+                servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+                vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+            }
+            is_flipped = true;
+        } else {
+            int FL_angles[] = {355, 210, 185, NEUTRAL_FL};
+            int FR_angles[] = {355, 210, 185, NEUTRAL_FR};
+            int BL_angles[] = {20, 205, 185, NEUTRAL_BL};
+            int BR_angles[] = {20, 205, 185, NEUTRAL_BR};
+            uint16_t delays_ms[] = {200, 150, 200, 50};
+
+            for (int i = 0; i < 4; i++) {
+                servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+                vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+            }
+            is_flipped = false;
+        }
+    }
+
+    void ShakeHand() {
+        ESP_LOGI(TAG, "Dog: >>> SHAKE HAND <<<");
+        int FL_angles[] = {NEUTRAL_FL, 260, 300, 260, 300, 260, 300, 260, 300, 260, 300, 260, NEUTRAL_FL};
+        int FR_angles[] = {NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR};
+        int BL_angles[] = {NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL};
+        int BR_angles[] = {NEUTRAL_BR, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, NEUTRAL_BR};
+        uint16_t delays_ms[] = {50, 100, 80, 80, 80, 80, 80, 80, 80, 80, 80, 100, 100};
+
+        for (int i = 0; i < 13; i++) {
+            servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+            vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+        }
+        MoveReset();
+    }
+
+    void Pounce() {
+        ESP_LOGI(TAG, "Dog: >>> POUNCE <<<");
+        int FL_angles[] = {210, 210, 170, NEUTRAL_FL};
+        int FR_angles[] = {165, 75, 170, NEUTRAL_FR};
+        int BL_angles[] = {210, 210, 230, NEUTRAL_BL};
+        int BR_angles[] = {165, 235, 230, NEUTRAL_BR};
+        uint16_t delays_ms[] = {300, 120, 150, 200};
+
+        for (int i = 0; i < 4; i++) {
+            servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+            vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+        }
+        MoveReset();
+    }
+
+    void SideFlip() {
+        ESP_LOGI(TAG, "Dog: >>> SIDE FLIP <<<");
+        if (!is_flipped) {
+            int FL_angles[] = {65, 210, 220, 165, 210};
+            int FR_angles[] = {65, 210, 90, 210, 210};
+            int BL_angles[] = {210, 65, 225, 115, 65};
+            int BR_angles[] = {210, 65, 225, 65, 65};
+            uint16_t delays_ms[] = {404, 343, 670, 230, 230};
+
+            for (int i = 0; i < 5; i++) {
+                servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+                vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+            }
+            is_flipped = true;
+        } else {
+            int FL_angles[] = {210, 65, 90, 210, NEUTRAL_FL};
+            int FR_angles[] = {210, 65, 220, 165, NEUTRAL_FR};
+            int BL_angles[] = {65, 210, 225, 65, NEUTRAL_BL};
+            int BR_angles[] = {65, 210, 225, 115, NEUTRAL_BR};
+            uint16_t delays_ms[] = {404, 343, 670, 230, 230};
+
+            for (int i = 0; i < 5; i++) {
+                servo_write_all(FL_angles[i], FR_angles[i], BL_angles[i], BR_angles[i], (uint16_t)global_servo_speed);
+                vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
+            }
+            is_flipped = false;
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────
+// HeySantaCodec (unchanged)
+// ─────────────────────────────────────────────────────────────
 class HeySantaCodec : public SantaAudioCodec  {
-private:    
-
 public:
     HeySantaCodec(i2c_master_bus_handle_t i2c_bus, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din, uint8_t es7210_addr, bool input_reference)
@@ -52,349 +392,94 @@ public:
     }
 };
 
+// ─────────────────────────────────────────────────────────────
+// HeySantaBoard (with robot dog inside!)
+// ─────────────────────────────────────────────────────────────
 class HeySantaBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
-    i2c_master_dev_handle_t pca9557_handle_;
     Button boot_button_;
     Button wake_button_;
     anim::EmojiWidget* display_ = nullptr;
     Esp32Camera* camera_;
-
-    volatile bool head_shake_active = false;
-
-    
-    void Initialize_Motor(void)
-    {
-        // Prepare and then apply the LEDC PWM timer configuration
-        ledc_timer_config_t ledc_timer = {
-            .speed_mode       = LEDC_MODE,
-            .duty_resolution  = LEDC_DUTY_RES,
-            .timer_num        = LEDC_TIMER,
-            .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 4 kHz
-            .clk_cfg          = LEDC_AUTO_CLK
-        };
-        ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-        // Array of channel configurations for easy iteration
-        const uint8_t motor_ledc_channel[LEDC_CHANNEL_COUNT] = {LEDC_M1_CHANNEL_A, LEDC_M1_CHANNEL_B, LEDC_M2_CHANNEL_A, LEDC_M2_CHANNEL_B};
-        const int32_t ledc_channel_pins[LEDC_CHANNEL_COUNT] = {LEDC_M1_CHANNEL_A_IO, LEDC_M1_CHANNEL_B_IO, LEDC_M2_CHANNEL_A_IO, LEDC_M2_CHANNEL_B_IO};
-        for (int i = 0; i < LEDC_CHANNEL_COUNT; i++) {
-            ledc_channel_config_t ledc_channel = {
-                .gpio_num       = ledc_channel_pins[i],
-                .speed_mode     = LEDC_MODE,
-                .channel        = (ledc_channel_t)motor_ledc_channel[i],
-                .intr_type      = LEDC_INTR_DISABLE,
-                .timer_sel      = LEDC_TIMER,
-                .duty           = 0, // Set duty to 0%
-                .hpoint         = 0
-            };
-            ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-        }
-    }
-
-    static void set_motor_A_speed(int speed)
-    {
-        if (speed >= 0) {
-            uint32_t m1a_duty = (uint32_t)((speed * m1_coefficient * 8192) / 100);
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M1_CHANNEL_A, m1a_duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M1_CHANNEL_A));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M1_CHANNEL_B, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M1_CHANNEL_B));
-        } else {
-            uint32_t m1b_duty = (uint32_t)((-speed * m1_coefficient * 8192) / 100);
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M1_CHANNEL_A, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M1_CHANNEL_A));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M1_CHANNEL_B, m1b_duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M1_CHANNEL_B));
-        }
-    }
-
-    static void set_motor_B_speed(int speed)
-    {
-        if (speed >= 0) {
-            uint32_t m2a_duty = (uint32_t)((speed * m2_coefficient * 8192) / 100);
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M2_CHANNEL_A, m2a_duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M2_CHANNEL_A));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M2_CHANNEL_B, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M2_CHANNEL_B));
-        } else {
-            uint32_t m2b_duty = (uint32_t)((-speed * m2_coefficient * 8192) / 100);
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M2_CHANNEL_A, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M2_CHANNEL_A));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_M2_CHANNEL_B, m2b_duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_M2_CHANNEL_B));
-        }
-    }
-    void movement_type(int motor, uint32_t mode, int dir) 
-    //motor: 1 for head, 2 for hip 
-    //mode: 0 for slow, 1 for mid, 2 for stop 
-    //dir: 1 for forward, -1 for backward
-    {
-        int speed_head[3] = {87, 93, 100}; 
-        int speed_hip[3] = {90, 95, 100};
-        int speed;
-        if (motor == 1)  
-        {
-            if (dir == 1) speed = speed_head[mode];
-            else speed = -speed_head[mode];
-            ESP_LOGI(TAG, "Setting head speed to %d", speed);
-            set_motor_A_speed(speed);
-        }
-        else 
-        {
-            if (dir == 1) speed = speed_hip[mode];
-            else speed = -speed_hip[mode];
-            ESP_LOGI(TAG, "Setting hip speed to %d", speed);
-            if (speed < 0) {
-                speed = abs(speed);
-                int step = speed / 4;
-                for (int i = 1 ; i <= 4 ; i++)
-                {
-                    set_motor_B_speed(speed); // Gradually increase speed to avoid sudden jerk
-                    speed -= step; 
-                    vTaskDelay(25 / portTICK_PERIOD_MS); // Wait for 0.1 second    
-                }
-                set_motor_B_speed(0); // Set final speed
-            }
-            else 
-            {
-                set_motor_B_speed(speed);
-            }
-        }
-    }
-
-    void SetHeadSpeed(int speed) {
-        ESP_LOGI(TAG, "Setting head speed to %d", speed);
-        set_motor_A_speed(speed);
-    }
-
-    void SetHipSpeed(int speed) {
-        ESP_LOGI(TAG, "Setting hip speed to %d", speed);
-        set_motor_B_speed(speed);    
-    }
-
-    uint32_t unbiasedRandom3() {
-        uint32_t r;
-        const uint32_t upper_bound = 0xFFFFFFFF - (0xFFFFFFFF % 3);
-        
-        do {
-            r = esp_random();
-        } while (r >= upper_bound);
-        
-        return r % 3;
-    }
-
-    uint32_t unbiasedRandomRange(int min, int max) {
-        // Calculate the range size
-        uint32_t range = max - min + 1;
-        
-        // Determine the upper bound to reject values that cause bias
-        uint32_t upper_bound = 0xFFFFFFFF - (0xFFFFFFFF % range);
-        uint32_t r;
-        
-        do {
-            r = esp_random(); // Get 32-bit random number from hardware
-        } while (r >= upper_bound);
-        
-        return min + (r % range);
-    }
-    void dance()
-    
-    {
-        head_shake_active = false;
-        for (int i = 1 ; i <= 3; i++) // dance for 3 times
-        {
-            uint32_t head_mode = unbiasedRandom3(); // Randomly choose head mode 
-            uint32_t hip_mode = unbiasedRandom3(); // Randomly choose hip mode
-            movement_type(1, head_mode, 1); // Head forward
-            vTaskDelay(unbiasedRandomRange(1500, 5000) / portTICK_PERIOD_MS); // Wait for 5 second
-            set_motor_A_speed(0); 
-            vTaskDelay(unbiasedRandomRange(150, 1000) / portTICK_PERIOD_MS); // Wait for 1 second
-            for (int j = 0; j < 3; j++) // Shake head 3 times
-            {
-                movement_type(2, hip_mode, 1); // Hip forward
-                vTaskDelay(150 / portTICK_PERIOD_MS); // Wait for 0.5 second
-
-                movement_type(2, hip_mode, -1); // Hip forward
-                vTaskDelay(150 / portTICK_PERIOD_MS); // Wait for 0.5 second
-            }
-            set_motor_B_speed(0);
-        }
-    }
-
-    void HeadShakeOnly() {
-        ESP_LOGI(TAG, "Head shake (on/off mode)!");
-        
-        // Soft start for head motor to reduce current surge
-        const int target_speed = 100;
-        const int ramp_steps = 5;
-        
-        for (int i = 0; i < 50; i++) {
-            // Ramp up forward
-            for (int step = 1; step <= ramp_steps; step++) {
-                SetHeadSpeed((target_speed * step) / ramp_steps);
-                vTaskDelay(5 / portTICK_PERIOD_MS);
-            }
-            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total forward
-            
-            // Ramp up backward
-            for (int step = 1; step <= ramp_steps; step++) {
-                SetHeadSpeed(-(target_speed * step) / ramp_steps);
-                vTaskDelay(5 / portTICK_PERIOD_MS);
-            }
-            vTaskDelay(55 / portTICK_PERIOD_MS);  // 80ms total backward
-        }
-        SetHeadSpeed(0);
-        ESP_LOGI(TAG, "Head shake complete!");
-    }
-        
-    void HeadShake_start() {
-        ESP_LOGI(TAG, "Head shake starting - will shake until manually stopped or timeout");
-        head_shake_active = true;
-        
-        auto& app = Application::GetInstance();
-        
-        for (int i = 0; head_shake_active; i++) {
-            ESP_LOGI(TAG, "Head shake cycle %d", i + 1);
-            
-            // Auto-stop conditions:
-            // 1. Device goes to idle (conversation ended)
-            // 2. Timeout after 60 seconds
-            if (app.GetDeviceState() == kDeviceStateIdle || i >= 150) {
-                ESP_LOGI(TAG, "Auto-stopping shake: state=%d, cycles=%d", 
-                        app.GetDeviceState(), i);
-                break;
-            }
-            
-            // ON phase - 1 second
-            SetHeadSpeed(100);
-            for (int j = 0; j < 10 && head_shake_active; j++) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-            }
-            
-            if (!head_shake_active) break;
-            
-            // OFF phase - 1 second  
-            SetHeadSpeed(0);
-            for (int j = 0; j < 10 && head_shake_active; j++) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-            }
-        }
-        
-        SetHeadSpeed(0);
-        head_shake_active = false;
-        ESP_LOGI(TAG, "Head shake completed");
-    }
-
-    void HeadShake_stop() {
-        ESP_LOGI(TAG, "stop Head shake (on/off mode)!");
-        head_shake_active = false;
-        for (int i = 0; i < 1; i++) {
-            SetHeadSpeed(100);   // Full speed forward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
-            
-            SetHeadSpeed(-100);  // Full speed backward
-            vTaskDelay(80 / portTICK_PERIOD_MS);
-        }
-        SetHeadSpeed(0);
-    }
-
-    void HipShakeOnly() {
-        head_shake_active = false;
-        ESP_LOGI(TAG, "Hip shake (on/off mode)!");
-        SetHeadSpeed(0);
-        
-        // Soft start: gradually ramp up motor speed to avoid current surge
-        const int target_speed = 72;
-        const int ramp_steps = 8;
-        int step_delay_ms = 30;
-        
-        for (int i = 0; i < 12; i++) {
-            // Gradual acceleration forward
-            for (int step = 1; step <= ramp_steps; step++) {
-                int speed = (target_speed * step) / ramp_steps;
-                SetHipSpeed(speed);
-                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
-            }
-            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
-            
-            // Stop
-            SetHipSpeed(0);
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-            
-            // Gradual acceleration backward
-            for (int step = 1; step <= ramp_steps; step++) {
-                int speed = -(target_speed * step) / ramp_steps;
-                SetHipSpeed(speed);
-                vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
-            }
-            vTaskDelay(50 / portTICK_PERIOD_MS);  // Hold at full speed
-            
-            // Stop
-            SetHipSpeed(0);
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-        }
-        SetHipSpeed(0);
-        ESP_LOGI(TAG, "Hip shake complete!");
-    }
+    ServoController servo_controller_;
 
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         
-        mcp_server.AddTool("self.chassis.dance", "跳舞", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGI(TAG, "Dance command received");
-            dance();
-            return true;
-        });
+        // Dog movement tools
+        mcp_server.AddTool("dog.walk", "Make the robot dog walk forward", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog walk command received");
+                servo_controller_.WalkForward(6);
+                return "Dog walked forward";
+            });
         
-        mcp_server.AddTool("self_chassis_shake_body", "摇头", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGI(TAG, "Head shake command received");
-            HeadShakeOnly();
-            return true;
-        });
+        mcp_server.AddTool("dog.dance", "Make the robot dog dance", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog dance command received");
+                servo_controller_.Dance();
+                return "Dog danced";
+            });
         
-        mcp_server.AddTool("self_chassis_shake_hip", "摇屁股", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGI(TAG, "Hip shake command received");
-            HipShakeOnly();
-            return true;
-        });
+        mcp_server.AddTool("dog.flip", "Make the robot dog do a flip", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog flip command received");
+                servo_controller_.Flip();
+                return "Dog flipped";
+            });
 
-        mcp_server.AddTool("self_chassis_shake_body_start", "摇头1", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            HeadShake_start();
-            return true;
-        });
+        mcp_server.AddTool("dog.shake_hand", "Make the robot dog shake its paw", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog shake hand command received");
+                servo_controller_.ShakeHand();
+                return "Dog shook hand";
+            });
 
-        mcp_server.AddTool("self_chassis_shake_body_stop", "摇头2", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            HeadShake_stop();
-            return true;
-        });
+        mcp_server.AddTool("dog.pounce", "Make the robot dog pounce", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog pounce command received");
+                servo_controller_.Pounce();
+                return "Dog pounced";
+            });
 
-        // BeQuiet/Silent tool - sets volume to 50%
-        mcp_server.AddTool("self.audio.be_quiet", "Make Santa speak more quietly by setting volume to 50%%. Use when user asks Santa to be quiet, silent, or speak softer.", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGI(TAG, "BeQuiet command received - setting volume to 50%%");
-            auto& board = Board::GetInstance();
-            auto codec = board.GetAudioCodec();
-            if (codec) {
-                codec->SetOutputVolume(50);
-                ESP_LOGI(TAG, "Volume set to 50%%");
-                return "Santa will now speak more quietly (volume set to 50%)";
-            } else {
-                ESP_LOGW(TAG, "Audio codec not available");
-                return "Audio codec not available";
-            }
-        });
+        mcp_server.AddTool("dog.side_flip", "Make the robot dog do a side flip", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog side flip command received");
+                servo_controller_.SideFlip();
+                return "Dog did side flip";
+            });
 
-        // Enough/Quit tool - sends exit command to server
-        mcp_server.AddTool("self.system.quit", "Quit the application and restart Santa. Use when user says goodbye, wants to end the conversation, or asks Santa to go away.", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            ESP_LOGI(TAG, " Quit command received - sending exit command to server");
-            auto& app = Application::GetInstance();
-            
-            // Send a system command to the server to exit/quit
-            app.SendSystemCommand("exit");
-            
-            return " Ho ho ho! Santa is telling the server to end this session. See you soon! 🎄";
-        });
+        mcp_server.AddTool("dog.reset", "Reset the robot dog to neutral position", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Dog reset command received");
+                servo_controller_.MoveReset();
+                return "Dog reset to neutral";
+            });
+
+        // Audio tool with escaped percent sign
+        mcp_server.AddTool("self.audio.be_quiet", "Make Santa speak more quietly by setting volume to 50%%. Use when user asks Santa to be quiet, silent, or speak softer.", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "BeQuiet command received - setting volume to 50%%");
+                auto& board = Board::GetInstance();
+                auto codec = board.GetAudioCodec();
+                if (codec) {
+                    codec->SetOutputVolume(50);
+                    ESP_LOGI(TAG, "Volume set to 50%%");
+                    return "Santa will now speak more quietly (volume set to 50%%)";
+                } else {
+                    ESP_LOGW(TAG, "Audio codec not available");
+                    return "Audio codec not available";
+                }
+            });
+
+        mcp_server.AddTool("self.system.quit", "Quit the application and restart Santa. Use when user says goodbye, wants to end the conversation, or asks Santa to go away.", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Quit command received - sending exit command to server");
+                auto& app = Application::GetInstance();
+                app.SendSystemCommand("exit");
+                return "Ho ho ho! Santa is telling the server to end this session. See you soon!";
+            });
     }
 
     void InitializeI2c() {
@@ -439,33 +524,14 @@ private:
                 ResetWifiConfiguration();
             }
             
-            // ADD SOUND BASED ON CURRENT STATE BEFORE TOGGLING
             if (app.GetDeviceState() == kDeviceStateIdle) {
-                // Going from idle to listening - play "entering listening" sound
                 app.PlaySound(Lang::Sounds::P3_ACTIVE);  
             } else if (app.GetDeviceState() == kDeviceStateListening) {
-                // Going from listening to idle - play "entering idle" sound  
                 app.PlaySound(Lang::Sounds::P3_DEACTIVATE); 
             }
             
             app.ToggleChatState();
         });
-
-    #if CONFIG_USE_DEVICE_AEC
-        boot_button_.OnDoubleClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
-            }
-        });
-
-        wake_button_.OnDoubleClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
-            }
-        });
-    #endif
     }
 
     void InitializeSt7735Display() {
@@ -474,63 +540,33 @@ private:
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
         
-        // Panel IO configuration for SPI
         esp_lcd_panel_io_spi_config_t io_config = {};
         io_config.cs_gpio_num = GPIO_NUM_NC;
         io_config.dc_gpio_num = GPIO_NUM_39;
         io_config.spi_mode = DISPLAY_SPI_MODE;
-        io_config.pclk_hz = 20 * 1000 * 1000;  // 20MHz for stability
+        io_config.pclk_hz = 20 * 1000 * 1000;
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
 
-        // Panel device configuration
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = GPIO_NUM_NC;
         panel_config.rgb_ele_order = DISPLAY_RGB_ORDER;
         panel_config.bits_per_pixel = 16;
         panel_config.vendor_config = nullptr;
         
-        // Create ST7735 panel
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7735(panel_io, &panel_config, &panel));
-        
-        // Initialize the panel
         ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
-        
-        // Configure for 160x80 ST7735S in landscape mode
         ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y));
-        
-        // Apply rotation/mirroring from your config
         ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY));
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
-        
-        // Color inversion
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR));
-        
-        // Turn on display
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
         
         ESP_LOGI(TAG, "ST7735 display initialized successfully");
-        
-        // Optional: Test pattern to verify display works
-        size_t buffer_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-        uint16_t *test_buffer = (uint16_t *)heap_caps_malloc(buffer_size, MALLOC_CAP_DMA);
-        if (test_buffer) {
-            // Fill with red to test
-            ESP_LOGI(TAG, "Drawing test pattern (red)");
-            for (int i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT; i++) {
-                test_buffer[i] = 0xF800;  // Red in RGB565
-            }
-            esp_lcd_panel_draw_bitmap(panel, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, test_buffer);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            free(test_buffer);
-        }
-        
-        // Create emoji widget
-        ESP_LOGI(TAG, "Creating emoji widget");
         display_ = new anim::EmojiWidget(panel, panel_io);
     }
 
@@ -570,18 +606,15 @@ public:
     HeySantaBoard() : boot_button_(BOOT_BUTTON_GPIO), wake_button_(WAKE_BUTTON_GPIO) {
         InitializeI2c();
         InitializeSpi();
-        InitializeSt7735Display(); // Actually initializes ILI9341 now
+        InitializeSt7735Display();
         InitializeButtons();
         InitializeCamera();
-        Initialize_Motor();
+        servo_controller_.Initialize();
         InitializeTools();
 
-#if CONFIG_IOT_PROTOCOL_XIAOZHI
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
-#endif
         GetBacklight()->RestoreBrightness();
+        
+        ESP_LOGI(TAG, "HeySanta board initialized with robot dog capabilities!");
     }
 
     virtual AudioCodec* GetAudioCodec() override {
