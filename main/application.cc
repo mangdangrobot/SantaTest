@@ -363,7 +363,7 @@ void Application::Start() {
     /* Start the clock timer to update the status bar */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
-    /* Wait for the network to be ready */
+    /* Wait for the network to be re`ady */
     board.StartNetwork();
 
     // Update the status bar immediately to show the network state
@@ -470,7 +470,7 @@ void Application::Start() {
                     Schedule([this]() {
                         ESP_LOGI(TAG, "Playing bell sound - device state: %s", STATE_STRINGS[device_state_]);
                         ESP_LOGI(TAG, "Playing P3_TAHU for HEYSANTA");
-                        audio_service_.PlaySound(Lang::Sounds::P3_TAHU);
+                        // audio_service_.PlaySound(Lang::Sounds::P3_TAHU);
                         ESP_LOGI(TAG, "P3_TAHU queued for HEYSANTA");
                     });
                     
@@ -483,36 +483,6 @@ void Application::Start() {
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (device_state_ == kDeviceStateSpeaking) {
-#ifdef CONFIG_BOARD_TYPE_HEYSANTA
-                        // Always do shake logic (same behavior for web panel and normal conversation)
-                        // Calculate the duration of TTS
-                        auto tts_end_time = std::chrono::steady_clock::now();
-                        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tts_end_time - tts_start_time).count();
-                        ESP_LOGI(TAG, "TTS sequence complete: %d ms [Web panel: %s]", (int)duration_ms, web_control_panel_active_ ? "active" : "inactive");
-
-                        // Only trigger stop shake for longer TTS sequences (likely actual speech, not MCP responses)
-                        // Only trigger stop shake for longer TTS sequences (likely actual speech, not MCP responses)
-                        if (duration_ms > 1) { // Only for TTS longer than 2 seconds
-                            ESP_LOGI(TAG, "TTS detected (%d ms), triggering stop shake [Web panel: %s]", (int)duration_ms, web_control_panel_active_ ? "active" : "inactive");
-
-                            Schedule([this]() {
-                                ESP_LOGI(TAG, "stop Head shake ");
-                                static int mcp_id_counter = 1000;
-                                mcp_id_counter++;
-                                char mcp_message[256];
-                                snprintf(mcp_message, sizeof(mcp_message),
-                                    "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\",\"params\":{\"name\":\"self_chassis_shake_body_stop\",\"arguments\":{}}}",
-                                    mcp_id_counter);
-                                McpServer::GetInstance().ParseMessage(mcp_message);
-                                
-                                // Update MCP timestamp to suppress future bells
-                                static std::chrono::steady_clock::time_point last_mcp_time;
-                                last_mcp_time = std::chrono::steady_clock::now();
-                            });
-                        } else {
-                            ESP_LOGI(TAG, "Short TTS detected (%d ms), skipping stop shake [Web panel: %s]", (int)duration_ms, web_control_panel_active_ ? "active" : "inactive");
-                        }
-#endif
 
                         vTaskDelay(pdMS_TO_TICKS(500));
                         // Different behavior for web panel vs normal conversation
@@ -546,36 +516,6 @@ void Application::Start() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-#ifdef CONFIG_BOARD_TYPE_HEYSANTA
-                // Configure shake probability (0-100 percent)
-                static const int SHAKE_PROBABILITY = 100; // Change this value to adjust chance (0-100)
-                
-                // Generate random number between 0-99
-                int random_chance = esp_random() % 100;
-                
-                if (random_chance < SHAKE_PROBABILITY) {
-                    ESP_LOGI(TAG, "User input detected, triggering body shake (chance: %d/%d) [Web panel: %s]", 
-                            random_chance, SHAKE_PROBABILITY, web_control_panel_active_ ? "active" : "inactive");
-                    Schedule([this]() {
-                        ESP_LOGI(TAG, "Trying to trigger shake...");
-                        static int mcp_id_counter = 1000;
-                        mcp_id_counter++;
-                        char mcp_message[256];
-                        snprintf(mcp_message, sizeof(mcp_message),
-                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\",\"params\":{\"name\":\"self_chassis_shake_body_start\",\"arguments\":{}}}",
-                            mcp_id_counter);
-                        McpServer::GetInstance().ParseMessage(mcp_message);
-                        ESP_LOGI(TAG, "Shake command sent via MCP with ID %d", mcp_id_counter);
-                        
-                        // Update MCP timestamp when sending MCP commands
-                        static std::chrono::steady_clock::time_point last_mcp_time;
-                        last_mcp_time = std::chrono::steady_clock::now();
-                    });
-                } else {
-                    ESP_LOGI(TAG, "User input detected, no shake this time (chance: %d/%d) [Web panel: %s]", 
-                            random_chance, SHAKE_PROBABILITY, web_control_panel_active_ ? "active" : "inactive");
-                }
-#endif
                 Schedule([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
