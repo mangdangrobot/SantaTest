@@ -32,9 +32,9 @@
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_awesome_20_4);
 
-// ─────────────────────────────────────────────────────────────
-// STS3032 Servo Protocol Definitions
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════
+// SERVO PROTOCOL
+// ═══════════════════════════════════════════════════════
 #define SERVO_UART_NUM UART_NUM_1
 #define SERVO_TX_PIN GPIO_NUM_10
 #define SERVO_RX_PIN GPIO_NUM_11
@@ -49,21 +49,352 @@ LV_FONT_DECLARE(font_awesome_20_4);
 #define STS_TORQUE_ENABLE 0x28
 #define STS_GOAL_POSITION_L 0x2A
 
-// Servo IDs
 #define SERVO_FL 2
 #define SERVO_FR 1
 #define SERVO_BL 4
 #define SERVO_BR 3
 
-// Neutral positions
+// Neutral positions - ORIGINAL VALUES
 #define NEUTRAL_FL 80
 #define NEUTRAL_FR 80
 #define NEUTRAL_BL 260
 #define NEUTRAL_BR 260
 
-// ─────────────────────────────────────────────────────────────
-// Servo Control Class
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════
+// QMI8658A IMU CONFIG
+// ═══════════════════════════════════════════════════════
+#define IMU_SDA_PIN         GPIO_NUM_1
+#define IMU_SCL_PIN         GPIO_NUM_2
+#define IMU_I2C_FREQ_HZ     400000
+
+#define IMU_I2C_ADDR_PRIMARY   0x6A
+#define IMU_I2C_ADDR_SECONDARY 0x6B
+
+#define IMU_CHIP_ID         0x05
+
+// QMI8658A Registers
+#define QMI_REG_CHIP_ID     0x00
+#define QMI_REG_REVISION    0x01
+#define QMI_REG_CTRL1       0x02
+#define QMI_REG_CTRL2       0x03
+#define QMI_REG_CTRL3       0x04
+#define QMI_REG_CTRL4       0x05
+#define QMI_REG_CTRL5       0x06
+#define QMI_REG_CTRL6       0x07
+#define QMI_REG_CTRL7       0x08
+#define QMI_REG_CTRL8       0x09
+#define QMI_REG_CTRL9       0x0A
+#define QMI_REG_STATUS0     0x2E
+#define QMI_REG_AX_L        0x35
+
+// Gyro Balance Config
+#define GYRO_BALANCE_ENABLED_DEFAULT    false
+#define GYRO_BALANCE_MAX_CORRECTION     90.0f
+#define GYRO_BALANCE_DEADZONE           0.5f
+#define GYRO_BALANCE_GAIN               1.6f
+#define GYRO_BALANCE_SMOOTHING          0.3f
+#define GYRO_BALANCE_DECAY              0.98f
+#define GYRO_BALANCE_UPDATE_INTERVAL_MS 50
+#define IMU_UPDATE_INTERVAL_MS          50
+#define GYRO_BALANCE_SPEED_MIN          150
+#define GYRO_BALANCE_SPEED_MAX          2000
+#define GYRO_BALANCE_SPEED_THRESHOLD    10.0f
+#define GYRO_BALANCE_SPEED_CURVE        1.2f
+#define GYRO_BALANCE_TOGGLE_THRESHOLD   150.0f
+#define GYRO_BALANCE_TOGGLE_WINDOW_MS   1000
+#define GYRO_BALANCE_TOGGLE_COOLDOWN_MS 1500
+
+struct ImuData {
+    float accel_x, accel_y, accel_z;
+    float gyro_x, gyro_y, gyro_z;
+    float accel_magnitude;
+};
+
+// ═══════════════════════════════════════════════════════
+// GLOBAL CONVERSATION LOCK
+// ═══════════════════════════════════════════════════════
+static volatile bool g_conversation_active = false;
+
+void SetConversationActive(bool active) {
+    g_conversation_active = active;
+    if (active) {
+        ESP_LOGI(TAG, "🔒 CONVERSATION ACTIVE - IMU balance paused");
+    } else {
+        ESP_LOGI(TAG, "🔓 CONVERSATION ENDED - IMU balance resumed");
+    }
+}
+
+bool IsConversationActive() {
+    return g_conversation_active;
+}
+
+// ═══════════════════════════════════════════════════════
+// IMU CONTROLLER
+// ═══════════════════════════════════════════════════════
+class ImuController {
+private:
+    bool initialized_ = false;
+    uint8_t detected_address_ = 0;
+    i2c_master_dev_handle_t imu_device_ = nullptr;
+    
+    esp_err_t WriteReg(uint8_t reg, uint8_t value) {
+        if (!imu_device_) return ESP_ERR_INVALID_STATE;
+        uint8_t buf[2] = {reg, value};
+        return i2c_master_transmit(imu_device_, buf, 2, 1000);
+    }
+    
+    esp_err_t ReadReg(uint8_t reg, uint8_t* value) {
+        if (!imu_device_) return ESP_ERR_INVALID_STATE;
+        return i2c_master_transmit_receive(imu_device_, &reg, 1, value, 1, 1000);
+    }
+    
+    esp_err_t ReadRegs(uint8_t reg, uint8_t* buf, size_t len) {
+        if (!imu_device_) return ESP_ERR_INVALID_STATE;
+        return i2c_master_transmit_receive(imu_device_, &reg, 1, buf, len, 1000);
+    }
+    
+    float AccelToMs2(int16_t raw) {
+        return (raw / 4096.0f) * 9.81f;
+    }
+    
+    float GyroToDps(int16_t raw) {
+        return raw / 64.0f;
+    }
+
+public:
+    bool Initialize(i2c_master_bus_handle_t i2c_bus) {
+        ESP_LOGI(TAG, "=== QMI8658A IMU Initialization ===");
+        
+        if (!i2c_bus) {
+            ESP_LOGE(TAG, "I2C bus handle is null");
+            return false;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        uint8_t addresses[] = {IMU_I2C_ADDR_PRIMARY, IMU_I2C_ADDR_SECONDARY};
+        bool found = false;
+        
+        for (int i = 0; i < 2; i++) {
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = addresses[i],
+                .scl_speed_hz = IMU_I2C_FREQ_HZ,
+            };
+            
+            i2c_master_dev_handle_t temp_dev;
+            if (i2c_master_bus_add_device(i2c_bus, &dev_cfg, &temp_dev) == ESP_OK) {
+                uint8_t chip_id;
+                uint8_t reg = QMI_REG_CHIP_ID;
+                if (i2c_master_transmit_receive(temp_dev, &reg, 1, &chip_id, 1, 1000) == ESP_OK) {
+                    if (chip_id == IMU_CHIP_ID) {
+                        ESP_LOGI(TAG, "✓ IMU found at address 0x%02X (chip ID: 0x%02X)", addresses[i], chip_id);
+                        imu_device_ = temp_dev;
+                        detected_address_ = addresses[i];
+                        found = true;
+                        break;
+                    }
+                }
+                i2c_master_bus_rm_device(temp_dev);
+            }
+        }
+        
+        if (!found) {
+            ESP_LOGE(TAG, "✗ IMU not found at 0x6A or 0x6B");
+            return false;
+        }
+        
+        WriteReg(QMI_REG_CTRL1, 0x80);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        WriteReg(QMI_REG_CTRL1, 0x40);
+        WriteReg(QMI_REG_CTRL2, 0x24);
+        WriteReg(QMI_REG_CTRL3, 0x54);
+        WriteReg(QMI_REG_CTRL7, 0x03);
+        WriteReg(QMI_REG_CTRL9, 0x00);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        uint8_t status;
+        if (ReadReg(QMI_REG_STATUS0, &status) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read status register");
+            return false;
+        }
+        
+        ESP_LOGI(TAG, "✓ IMU initialized (status: 0x%02X)", status);
+        ESP_LOGI(TAG, "  Config: ±8g accel, ±512dps gyro, 500Hz ODR");
+        
+        initialized_ = true;
+        return true;
+    }
+    
+    bool Read(ImuData* data) {
+        if (!initialized_) return false;
+        
+        uint8_t buf[12];
+        if (ReadRegs(QMI_REG_AX_L, buf, 12) != ESP_OK) {
+            return false;
+        }
+        
+        int16_t raw_ax = (int16_t)((buf[1] << 8) | buf[0]);
+        int16_t raw_ay = (int16_t)((buf[3] << 8) | buf[2]);
+        int16_t raw_az = (int16_t)((buf[5] << 8) | buf[4]);
+        int16_t raw_gx = (int16_t)((buf[7] << 8) | buf[6]);
+        int16_t raw_gy = (int16_t)((buf[9] << 8) | buf[8]);
+        int16_t raw_gz = (int16_t)((buf[11] << 8) | buf[10]);
+        
+        data->accel_x = AccelToMs2(raw_ax);
+        data->accel_y = AccelToMs2(raw_ay);
+        data->accel_z = AccelToMs2(raw_az);
+        data->gyro_x = GyroToDps(raw_gx);
+        data->gyro_y = GyroToDps(raw_gy);
+        data->gyro_z = GyroToDps(raw_gz);
+        data->accel_magnitude = sqrtf(data->accel_x * data->accel_x + 
+                                       data->accel_y * data->accel_y + 
+                                       data->accel_z * data->accel_z);
+        return true;
+    }
+    
+    bool IsInitialized() const { return initialized_; }
+    uint8_t GetAddress() const { return detected_address_; }
+};
+
+// ═══════════════════════════════════════════════════════
+// GYRO BALANCE CONTROLLER
+// ═══════════════════════════════════════════════════════
+class GyroBalanceController {
+private:
+    bool enabled_ = false;
+    float accumulated_angle_ = 0.0f;
+    float last_correction_ = 0.0f;
+    uint32_t last_update_time_ = 0;
+    
+    enum ToggleState { IDLE, FIRST_ROTATION, WAITING_REVERSE };
+    ToggleState toggle_state_ = IDLE;
+    bool first_rotation_positive_ = false;
+    uint32_t first_rotation_time_ = 0;
+    uint32_t last_toggle_time_ = 0;
+    
+    uint16_t CalculateDynamicSpeed(float angle_delta) {
+        float abs_delta = fabsf(angle_delta);
+        if (abs_delta < 0.5f) return GYRO_BALANCE_SPEED_MIN;
+        
+        float normalized = abs_delta / GYRO_BALANCE_SPEED_THRESHOLD;
+        if (normalized > 1.0f) normalized = 1.0f;
+        
+        float curved = powf(normalized, GYRO_BALANCE_SPEED_CURVE);
+        uint16_t speed = GYRO_BALANCE_SPEED_MIN + 
+                        (uint16_t)(curved * (GYRO_BALANCE_SPEED_MAX - GYRO_BALANCE_SPEED_MIN));
+        
+        if (speed > GYRO_BALANCE_SPEED_MAX) speed = GYRO_BALANCE_SPEED_MAX;
+        return speed;
+    }
+    
+public:
+    bool ProcessToggle(float gyro_x) {
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        
+        if ((now - last_toggle_time_) < GYRO_BALANCE_TOGGLE_COOLDOWN_MS) {
+            return false;
+        }
+        
+        bool toggled = false;
+        
+        switch (toggle_state_) {
+            case IDLE:
+                if (fabsf(gyro_x) > GYRO_BALANCE_TOGGLE_THRESHOLD) {
+                    toggle_state_ = FIRST_ROTATION;
+                    first_rotation_positive_ = (gyro_x > 0);
+                    first_rotation_time_ = now;
+                }
+                break;
+                
+            case FIRST_ROTATION:
+                if ((now - first_rotation_time_) > GYRO_BALANCE_TOGGLE_WINDOW_MS) {
+                    toggle_state_ = IDLE;
+                } else if (fabsf(gyro_x) < GYRO_BALANCE_TOGGLE_THRESHOLD * 0.5f) {
+                    toggle_state_ = WAITING_REVERSE;
+                }
+                break;
+                
+            case WAITING_REVERSE:
+                if ((now - first_rotation_time_) > GYRO_BALANCE_TOGGLE_WINDOW_MS) {
+                    toggle_state_ = IDLE;
+                } else if (fabsf(gyro_x) > GYRO_BALANCE_TOGGLE_THRESHOLD) {
+                    bool current_positive = (gyro_x > 0);
+                    if (current_positive != first_rotation_positive_) {
+                        enabled_ = !enabled_;
+                        toggled = true;
+                        last_toggle_time_ = now;
+                        toggle_state_ = IDLE;
+                        
+                        accumulated_angle_ = 0.0f;
+                        last_correction_ = 0.0f;
+                        
+                        ESP_LOGI("GyroBalance", "TOGGLE! Balance mode: %s", 
+                                 enabled_ ? "ENABLED" : "DISABLED");
+                    } else {
+                        toggle_state_ = IDLE;
+                    }
+                }
+                break;
+        }
+        
+        return toggled;
+    }
+    
+    struct BalanceResult {
+        float front_offset;
+        float back_offset;
+        uint16_t speed;
+    };
+    
+    BalanceResult Calculate(float gyro_y, float dt_sec) {
+        BalanceResult result = {0.0f, 0.0f, GYRO_BALANCE_SPEED_MIN};
+        
+        if (!enabled_) return result;
+        
+        float filtered_gyro = gyro_y;
+        if (fabsf(filtered_gyro) < GYRO_BALANCE_DEADZONE) {
+            filtered_gyro = 0.0f;
+        }
+        
+        float raw_integration = filtered_gyro * dt_sec;
+        accumulated_angle_ += raw_integration * GYRO_BALANCE_SMOOTHING;
+        accumulated_angle_ *= GYRO_BALANCE_DECAY;
+        
+        float correction = accumulated_angle_ * GYRO_BALANCE_GAIN;
+        
+        if (correction > GYRO_BALANCE_MAX_CORRECTION) correction = GYRO_BALANCE_MAX_CORRECTION;
+        if (correction < -GYRO_BALANCE_MAX_CORRECTION) correction = -GYRO_BALANCE_MAX_CORRECTION;
+        
+        float correction_delta = correction - last_correction_;
+        result.speed = CalculateDynamicSpeed(correction_delta);
+        last_correction_ = correction;
+        
+        result.front_offset = correction;
+        result.back_offset = -correction;
+        
+        return result;
+    }
+    
+    void Enable(bool enable) { 
+        enabled_ = enable;
+        if (!enable) {
+            accumulated_angle_ = 0.0f;
+            last_correction_ = 0.0f;
+        }
+    }
+    bool IsEnabled() const { return enabled_; }
+    void Reset() { 
+        accumulated_angle_ = 0.0f; 
+        last_correction_ = 0.0f;
+    }
+};
+
+// ═══════════════════════════════════════════════════════
+// SERVO CONTROLLER - ORIGINAL MOVEMENTS
+// ═══════════════════════════════════════════════════════
 class ServoController {
 private:
     int global_servo_speed = 4095;
@@ -191,9 +522,8 @@ private:
 
 public:
     void Initialize() {
-        ESP_LOGI(TAG, "Initializing servo controller (robot dog inside HeySanta)...");
+        ESP_LOGI(TAG, "Initializing servo controller...");
         
-        // Configure TX enable pin
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << SERVO_TXEN_PIN),
             .mode = GPIO_MODE_OUTPUT,
@@ -204,7 +534,6 @@ public:
         gpio_config(&io_conf);
         gpio_set_level(SERVO_TXEN_PIN, 0);
 
-        // Configure UART
         uart_config_t uart_config = {
             .baud_rate = SERVO_BAUD_RATE,
             .data_bits = UART_DATA_8_BITS,
@@ -221,7 +550,6 @@ public:
 
         vTaskDelay(pdMS_TO_TICKS(500));
 
-        // Enable torque on all servos
         ESP_LOGI(TAG, "Enabling servo torque...");
         for (uint8_t id = 1; id <= 4; id++) {
             sts_enable_torque(id, true);
@@ -249,13 +577,31 @@ public:
 
     void MoveReset() {
         ESP_LOGI(TAG, "Dog: Resetting to neutral");
+        SetConversationActive(true);  // **BLOCK IMU**
         servo_write_all(NEUTRAL_FL, NEUTRAL_FR, NEUTRAL_BL, NEUTRAL_BR, (uint16_t)global_servo_speed);
         is_flipped = false;
         vTaskDelay(pdMS_TO_TICKS(1000));
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
+    void ApplyBalance(float front_offset, float back_offset, uint16_t speed) {
+        if (IsConversationActive()) return;  // **CHECK CONVERSATION LOCK**
+        
+        float fl = NEUTRAL_FL + front_offset;
+        float fr = NEUTRAL_FR + front_offset;
+        float bl = NEUTRAL_BL - back_offset;
+        float br = NEUTRAL_BR - back_offset;
+
+        servo_write_all(fl, fr, bl, br, speed);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // ORIGINAL WORKING MOVEMENTS
+    // ═══════════════════════════════════════════════════════
     void WalkForward(int loops = 6) {
         ESP_LOGI(TAG, "Dog: >>> WALKING FORWARD <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         int FL_angles[] = {65, 35, 100, 65};
         int FR_angles[] = {65, 95, 65, 40};
         int BL_angles[] = {210, 245, 210, 175};
@@ -269,10 +615,13 @@ public:
             }
         }
         MoveReset();
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
     void Dance() {
         ESP_LOGI(TAG, "Dog: >>> DANCING <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         int FL_dance[] = {65,50,35,20,35,50,65,45,25,5,25,45,65,40,65,30,65,40,65,30,15,30,65};
         int FR_dance[] = {65,80,95,110,95,80,65,85,105,125,105,85,65,90,65,100,65,90,65,100,115,100,65};
         int BL_dance[] = {210,225,240,255,240,225,210,230,250,265,250,230,210,235,210,245,210,235,210,245,260,245,210};
@@ -286,10 +635,13 @@ public:
             }
         }
         MoveReset();
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
     void Flip() {
         ESP_LOGI(TAG, "Dog: >>> FLIP <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         if (!is_flipped) {
             int FL_angles[] = {210, 185, 210, 355};
             int FR_angles[] = {210, 185, 210, 355};
@@ -315,10 +667,14 @@ public:
             }
             is_flipped = false;
         }
+        
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
     void ShakeHand() {
         ESP_LOGI(TAG, "Dog: >>> SHAKE HAND <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         int FL_angles[] = {NEUTRAL_FL, 260, 300, 260, 300, 260, 300, 260, 300, 260, 300, 260, NEUTRAL_FL};
         int FR_angles[] = {NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR, NEUTRAL_FR};
         int BL_angles[] = {NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL, NEUTRAL_BL};
@@ -330,10 +686,13 @@ public:
             vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
         }
         MoveReset();
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
     void Pounce() {
         ESP_LOGI(TAG, "Dog: >>> POUNCE <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         int FL_angles[] = {210, 210, 170, NEUTRAL_FL};
         int FR_angles[] = {165, 75, 170, NEUTRAL_FR};
         int BL_angles[] = {210, 210, 230, NEUTRAL_BL};
@@ -345,10 +704,13 @@ public:
             vTaskDelay(delays_ms[i] / portTICK_PERIOD_MS);
         }
         MoveReset();
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 
     void SideFlip() {
         ESP_LOGI(TAG, "Dog: >>> SIDE FLIP <<<");
+        SetConversationActive(true);  // **BLOCK IMU**
+        
         if (!is_flipped) {
             int FL_angles[] = {65, 210, 220, 165, 210};
             int FR_angles[] = {65, 210, 90, 210, 210};
@@ -374,12 +736,14 @@ public:
             }
             is_flipped = false;
         }
+        
+        SetConversationActive(false);  // **UNBLOCK IMU**
     }
 };
 
-// ─────────────────────────────────────────────────────────────
-// HeySantaCodec (unchanged)
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════
+// AUDIO CODEC
+// ═══════════════════════════════════════════════════════
 class HeySantaCodec : public SantaAudioCodec  {
 public:
     HeySantaCodec(i2c_master_bus_handle_t i2c_bus, int input_sample_rate, int output_sample_rate,
@@ -389,12 +753,13 @@ public:
 
     virtual void EnableOutput(bool enable) override {
         SantaAudioCodec::EnableOutput(enable);
+        SetConversationActive(enable);  // **BLOCK IMU WHEN SPEAKING**
     }
 };
 
-// ─────────────────────────────────────────────────────────────
-// HeySantaBoard (with robot dog inside!)
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════
+// HEYSANTABOARD
+// ═══════════════════════════════════════════════════════
 class HeySantaBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -403,11 +768,46 @@ private:
     anim::EmojiWidget* display_ = nullptr;
     Esp32Camera* camera_;
     ServoController servo_controller_;
+    ImuController imu_controller_;
+    GyroBalanceController gyro_balance_;
+    TaskHandle_t imu_task_handle_ = nullptr;
+    bool imu_task_running_ = false;
+    uint32_t last_imu_time_ = 0;
+
+    static void ImuTaskWrapper(void* param) {
+        static_cast<HeySantaBoard*>(param)->ImuTask();
+    }
+
+    void ImuTask() {
+        ESP_LOGI(TAG, "IMU monitoring task started");
+        const TickType_t interval = pdMS_TO_TICKS(IMU_UPDATE_INTERVAL_MS);
+        ImuData imu_data;
+        
+        while (imu_task_running_) {
+            if (imu_controller_.Read(&imu_data)) {
+                uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                float dt = (now - last_imu_time_) / 1000.0f;
+                if (dt <= 0.0f || dt > 1.0f) dt = 0.05f;
+                last_imu_time_ = now;
+                
+                gyro_balance_.ProcessToggle(imu_data.gyro_x);
+                
+                // **ONLY RUN IF NOT TALKING**
+                if (gyro_balance_.IsEnabled() && !IsConversationActive()) {
+                    auto result = gyro_balance_.Calculate(imu_data.gyro_y, dt);
+                    servo_controller_.ApplyBalance(result.front_offset, result.back_offset, result.speed);
+                }
+            }
+            vTaskDelay(interval);
+        }
+        
+        ESP_LOGI(TAG, "IMU monitoring task stopped");
+        vTaskDelete(NULL);
+    }
 
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         
-        // Dog movement tools
         mcp_server.AddTool("dog.walk", "Make the robot dog walk forward", PropertyList(), 
             [this](const PropertyList& properties) -> ReturnValue {
                 ESP_LOGI(TAG, "Dog walk command received");
@@ -457,36 +857,62 @@ private:
                 return "Dog reset to neutral";
             });
 
-        // Audio tool with escaped percent sign
-        mcp_server.AddTool("self.audio.be_quiet", "Make Santa speak more quietly by setting volume to 50%%. Use when user asks Santa to be quiet, silent, or speak softer.", PropertyList(), 
+        mcp_server.AddTool("dog.balance_enable", "Enable gyro balance mode", PropertyList(), 
             [this](const PropertyList& properties) -> ReturnValue {
-                ESP_LOGI(TAG, "BeQuiet command received - setting volume to 50%%");
+                ESP_LOGI(TAG, "Balance enable command received");
+                gyro_balance_.Enable(true);
+                return "Gyro balance mode enabled";
+            });
+
+        mcp_server.AddTool("dog.balance_disable", "Disable gyro balance mode", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "Balance disable command received");
+                gyro_balance_.Enable(false);
+                servo_controller_.MoveReset();
+                return "Gyro balance mode disabled";
+            });
+
+        mcp_server.AddTool("dog.balance_status", "Get current gyro balance mode status", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = gyro_balance_.IsEnabled();
+                bool imu_ok = imu_controller_.IsInitialized();
+                char status[128];
+                snprintf(status, sizeof(status), "Balance: %s, IMU: %s (addr: 0x%02X)", 
+                         enabled ? "ENABLED" : "DISABLED",
+                         imu_ok ? "OK" : "NOT AVAILABLE",
+                         imu_controller_.GetAddress());
+                return std::string(status);
+            });
+
+        mcp_server.AddTool("self.audio.be_quiet", "Make Santa speak more quietly (50% volume)", PropertyList(), 
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "BeQuiet command - setting volume to 50%%");
                 auto& board = Board::GetInstance();
                 auto codec = board.GetAudioCodec();
                 if (codec) {
                     codec->SetOutputVolume(50);
-                    ESP_LOGI(TAG, "Volume set to 50%%");
-                    return "Santa will now speak more quietly (volume set to 50%%)";
+                    return "Santa will now speak more quietly (50% volume)";
                 } else {
-                    ESP_LOGW(TAG, "Audio codec not available");
                     return "Audio codec not available";
                 }
             });
 
-        mcp_server.AddTool("self.system.quit", "Quit the application and restart Santa. Use when user says goodbye, wants to end the conversation, or asks Santa to go away.", PropertyList(), 
+        mcp_server.AddTool("self.system.quit", "Quit the application and restart Santa", PropertyList(), 
             [this](const PropertyList& properties) -> ReturnValue {
-                ESP_LOGI(TAG, "Quit command received - sending exit command to server");
+                ESP_LOGI(TAG, "Quit command - sending exit to server");
                 auto& app = Application::GetInstance();
                 app.SendSystemCommand("exit");
-                return "Ho ho ho! Santa is telling the server to end this session. See you soon!";
+                return "Ho ho ho! Santa is ending this session. See you soon!";
             });
     }
 
     void InitializeI2c() {
+        ESP_LOGI(TAG, "=== Initializing SINGLE I2C bus on GPIO1/GPIO2 ===");
+        
         i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = (i2c_port_t)1,
-            .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
-            .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
+            .i2c_port = I2C_NUM_0,
+            .sda_io_num = IMU_SDA_PIN,
+            .scl_io_num = IMU_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
@@ -495,7 +921,13 @@ private:
                 .enable_internal_pullup = 1,
             },
         };
-        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+        
+        esp_err_t ret = i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create I2C bus: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "✓ I2C bus created on GPIO1/GPIO2 (shared by IMU + codec + camera)");
+        }
     }
 
     void InitializeSpi() {
@@ -535,7 +967,7 @@ private:
     }
 
     void InitializeSt7735Display() {
-        ESP_LOGI(TAG, "Initializing ST7735 display (160x80)...");
+        ESP_LOGI(TAG, "Initializing ST7735 display...");
         
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
@@ -566,7 +998,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
         
-        ESP_LOGI(TAG, "ST7735 display initialized successfully");
+        ESP_LOGI(TAG, "✓ Display initialized");
         display_ = new anim::EmojiWidget(panel, panel_io);
     }
 
@@ -588,7 +1020,7 @@ private:
         config.pin_href = CAMERA_PIN_HREF;
         config.pin_sccb_sda = -1;
         config.pin_sccb_scl = CAMERA_PIN_SIOC;
-        config.sccb_i2c_port = 1;
+        config.sccb_i2c_port = 0;
         config.pin_pwdn = CAMERA_PIN_PWDN;
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
@@ -608,18 +1040,37 @@ public:
         InitializeSpi();
         InitializeSt7735Display();
         InitializeButtons();
-        InitializeCamera();
+        // InitializeCamera();
         servo_controller_.Initialize();
-        InitializeTools();
 
+         vTaskDelay(pdMS_TO_TICKS(500));
+        
+        if (imu_controller_.Initialize(i2c_bus_)) {
+            imu_task_running_ = true;
+            last_imu_time_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            xTaskCreate(ImuTaskWrapper, "imu_task", 4096, this, 5, &imu_task_handle_);
+            ESP_LOGI(TAG, "✓ IMU task started");
+        } else {
+            ESP_LOGW(TAG, "✗ IMU initialization failed - balance mode disabled");
+        }
+        
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
         
-        ESP_LOGI(TAG, "HeySanta board initialized with robot dog capabilities!");
+        ESP_LOGI(TAG, "=== HeySanta board initialized! ===");
+    }
+    
+    ~HeySantaBoard() {
+        if (imu_task_running_) {
+            imu_task_running_ = false;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {
         static HeySantaCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
+            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, 
+            AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
         return &audio_codec;
     }
 
